@@ -5,6 +5,7 @@ should be visible in both
 four
 five
 six
+upstream work
 New feature
 Another feature
 test content
