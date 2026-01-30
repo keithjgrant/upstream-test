@@ -38,37 +38,8 @@ echo -e "${YELLOW}==> Fetching latest changes...${NC}"
 git fetch origin
 git fetch upstream
 
-# Check if upstream has new commits that aren't in downstream main yet
-# (e.g., from merged PRs that need to be integrated)
-# Use cherry to check by content, not SHA (handles cherry-picks)
-# Exclude merge commits (--no-merges) since we cherry-pick actual changes
-UPSTREAM_NEW_COMMITS=$(git log main..upstream/main --oneline --cherry-pick --right-only --no-merges 2>/dev/null | wc -l | tr -d ' ')
-
-if [[ "$UPSTREAM_NEW_COMMITS" -gt 0 ]]; then
-    echo -e "${YELLOW}⚠ Upstream has $UPSTREAM_NEW_COMMITS new commit(s) not in downstream main.${NC}"
-    echo ""
-    echo "These commits need to be integrated into downstream main first:"
-    git log main..upstream/main --oneline --cherry-pick --right-only --no-merges
-    echo ""
-    echo -e "${YELLOW}Recommended workflow:${NC}"
-    echo "  1. Create a branch: git checkout -b sync-from-upstream"
-    echo "  2. Cherry-pick or merge: git cherry-pick <commit> (or git merge upstream/main)"
-    echo "  3. Push and create PR: git push origin sync-from-upstream"
-    echo "  4. Run CI tests (including downstream integration tests)"
-    echo "  5. After PR merges, run this script again"
-    echo ""
-    echo "Aborting. Please sync upstream changes to main first."
-    exit 1
-fi
-
 echo -e "${YELLOW}==> Checking out upstream-public branch...${NC}"
 git checkout upstream-public
-
-echo -e "${YELLOW}==> Rebasing upstream-public onto main...${NC}"
-if git rebase main; then
-    echo -e "${GREEN}✓ Rebase successful${NC}"
-else
-    echo -e "${YELLOW}⚠ Rebase has conflicts. Checking if auto-resolvable...${NC}"
     
     # Get list of conflicted files
     CONFLICTS=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
@@ -79,8 +50,8 @@ else
         exit 1
     fi
     
-    # Check if conflicts are only private files
-    AUTO_RESOLVED=false
+    # Check if conflicts are only private files or upstream-modified files
+    ALL_AUTO_RESOLVABLE=true
     for conflict in $CONFLICTS; do
         IS_PRIVATE=false
         for private_file in "${PRIVATE_FILES[@]}"; do
@@ -90,16 +61,66 @@ else
             fi
         done
         
-        if [[ "$IS_PRIVATE" == "false" ]]; then
+        # Check if conflict exists in upstream (indicates upstream PR changes)
+        IS_IN_UPSTREAM=false
+        if git ls-tree -r upstream/main --name-only | grep -q "^$conflict$"; then
+            IS_IN_UPSTREAM=true
+        fi
+        
+        if [[ "$IS_PRIVATE" == "false" ]] && [[ "$IS_IN_UPSTREAM" == "false" ]]; then
             echo -e "${RED}✗ Unexpected conflict in: $conflict${NC}"
-            echo -e "${RED}This is not a known private file. Please resolve manually:${NC}"
+            echo -e "${RED}This is not a known private file or upstream change.${NC}"
+            echo "Please resolve manually:"
             echo "  1. Fix conflicts"
             echo "  2. git add/rm conflicted files"
             echo "  3. git rebase --continue"
             echo "  4. Re-run this script"
-            exit 1
+            ALL_AUTO_RESOLVABLE=false
         fi
     done
+    
+    if [[ "$ALL_AUTO_RESOLVABLE" == "false" ]]; then
+        git rebase --abort
+        exit 1
+    fi
+    
+    # Check if any conflicts are from upstream changes
+    HAS_UPSTREAM_CONFLICTS=false
+    for conflict in $CONFLICTS; do
+        if git ls-tree -r upstream/main --name-only | grep -q "^$conflict$"; then
+            IS_PRIVATE=false
+            for private_file in "${PRIVATE_FILES[@]}"; do
+                if [[ "$conflict" == "$private_file" ]]; then
+                    IS_PRIVATE=true
+                    break
+                fi
+            done
+            if [[ "$IS_PRIVATE" == "false" ]]; then
+                HAS_UPSTREAM_CONFLICTS=true
+                break
+            fi
+        fi
+    done
+    
+    if [[ "$HAS_UPSTREAM_CONFLICTS" == "true" ]]; then
+        echo -e "${YELLOW}⚠ Conflicts detected in files modified by upstream PRs.${NC}"
+        echo ""
+        echo -e "${YELLOW}Recommended: Integrate upstream changes first via PR:${NC}"
+        echo "  1. git rebase --abort"
+        echo "  2. git checkout main"
+        echo "  3. git checkout -b sync-from-upstream"
+        echo "  4. git cherry-pick <upstream-commits>"
+        echo "  5. Create PR and run CI tests"
+        echo "  6. After PR merges, re-run this script"
+        echo ""
+        read -p "Continue with auto-resolution anyway? (yes/no): " continue_confirm
+        
+        if [[ "$continue_confirm" != "yes" ]]; then
+            git rebase --abort
+            echo "Aborted. Please integrate upstream changes via PR first."
+            exit 1
+        fi
+    fi
     
     # All conflicts are private files - auto-resolve by removing them
     echo -e "${YELLOW}==> Auto-resolving conflicts (removing private files)...${NC}"
